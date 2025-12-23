@@ -16,6 +16,8 @@
 #define LCD_BACKLIGHT        21
 
 #define BUTTON1_PIN          20
+#define BUTTON2_PIN          10
+#define BUTTON3_PIN          5 // Use GPIO 5 (safe pin, no flash/boot conflicts)
 
 #define FONT_BIG             u8g2_font_t0_40_tf // 23 pixels high
 #define FONT_MEDIUM          u8g2_font_t0_22_tf // 13 pixels high
@@ -97,6 +99,25 @@ settings                           config = {};
 HALight                            backlight("light", HALight::BrightnessFeature);
 HANumber                           contrast("number");
 
+HADeviceTrigger                    trigger1short(HADeviceTrigger::ButtonShortPressType, "btn1");
+HADeviceTrigger                    trigger1long(HADeviceTrigger::ButtonLongPressType, "btn1");
+bool                               triggered1long  = false;
+bool                               triggered1short = false;
+
+HADeviceTrigger                    trigger2short(HADeviceTrigger::ButtonShortPressType, "btn2");
+HADeviceTrigger                    trigger2long(HADeviceTrigger::ButtonLongPressType, "btn2");
+bool                               triggered2long          = false;
+bool                               triggered2short         = false;
+
+long                               button1PressinTime      = 0;
+long                               button2PressinTime      = 0;
+volatile unsigned long             button1LastDebounce     = 0;
+volatile unsigned long             button2LastDebounce     = 0;
+const unsigned long                BUTTON_DEBOUNCE_TIME    = 50; // ms
+
+const long                         BUTTON_LONGPRESS_TIME   = 500; // ms
+
+
 ActivityState                      currentActivityState    = ACTIVITY_HIGH;
 
 float                              PrimaryData             = 0.0f;
@@ -142,12 +163,73 @@ void IRAM_ATTR         buttonISR() {
     }
 }
 
+void IRAM_ATTR usageButton1ISR() {
+    unsigned long currentTime = millis();
+    if((currentTime - button1LastDebounce) < BUTTON_DEBOUNCE_TIME) return;
+    button1LastDebounce = currentTime;
+
+    int state           = digitalRead(BUTTON2_PIN);
+    if(state == HIGH) {
+        // RISING - button pressed
+        button1PressinTime = currentTime;
+        buttonISR();
+    } else {
+        // FALLING - button released
+        if((currentTime - button1PressinTime) >= BUTTON_LONGPRESS_TIME)
+            triggered1long = true;
+        else
+            triggered1short = true;
+    }
+}
+
+void IRAM_ATTR usageButton2ISR() {
+    unsigned long currentTime = millis();
+    if((currentTime - button2LastDebounce) < BUTTON_DEBOUNCE_TIME) return;
+    button2LastDebounce = currentTime;
+
+    int state           = digitalRead(BUTTON3_PIN);
+    if(state == HIGH) {
+        // RISING - button pressed
+        button2PressinTime = currentTime;
+        buttonISR();
+    } else {
+        // FALLING - button released
+        if((currentTime - button2PressinTime) >= BUTTON_LONGPRESS_TIME)
+            triggered2long = true;
+        else
+            triggered2short = true;
+    }
+}
+
+void serviceCheck() {
+    // Check WiFi connection
+    if(WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected. Attempting to reconnect...");
+        WiFi.reconnect();
+        delay(500);
+    }
+
+    // Check MQTT connection
+    if(!mqtt.isConnected()) {
+        Serial.println("MQTT disconnected. Attempting to reconnect...");
+        mqtt.begin(config.mqtt_server, config.mqtt_user, config.mqtt_password);
+        delay(500);
+    }
+
+    mqtt.loop();
+}
+
 void setup() {
     // Configure LEDC PWM and attach GPIO 21
     Serial.begin(115200);
     pinMode(LCD_BACKLIGHT, OUTPUT);
     pinMode(BUTTON1_PIN, INPUT_PULLUP);
+    pinMode(BUTTON2_PIN, INPUT_PULLDOWN);
+    pinMode(BUTTON3_PIN, INPUT_PULLDOWN);
     attachInterrupt(digitalPinToInterrupt(BUTTON1_PIN), buttonISR, RISING);
+
+    attachInterrupt(digitalPinToInterrupt(BUTTON2_PIN), usageButton1ISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(BUTTON3_PIN), usageButton2ISR, CHANGE);
 
     // Try mounting
     if(!LittleFS.begin()) {
@@ -254,17 +336,38 @@ void setup() {
 
     contrast.setState(static_cast<float>(config.LCD_CONTRAST_VAL));
 
-    WiFi.setSleep(true); // Enable WiFi sleep to save power
-
     mqtt.loop();
 
-    Serial.println("Button interrupt initialized on GPIO 20");
+    // enable light sleep
+    WiFi.setSleep(true);                // This is light sleep, not deep sleep
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM); // Minimal power saving
 }
 
 void loop() {
-    mqtt.loop();
-    delay(1000);
+    if(triggered1long) {
+        trigger1long.trigger();
+        triggered1long = false;
+        Serial.println("Long press 1 detected");
+    }
+    if(triggered1short) {
+        trigger1short.trigger();
+        triggered1short = false;
+        Serial.println("Short press 1 detected");
+    }
+    if(triggered2long) {
+        trigger2long.trigger();
+        triggered2long = false;
+        Serial.println("Long press 2 detected");
+    }
+    if(triggered2short) {
+        trigger2short.trigger();
+        triggered2short = false;
+        Serial.println("Short press 2 detected");
+    }
+
     render();
+    mqtt.loop();
+    serviceCheck();
 
     long currentTime = millis();
 
@@ -279,9 +382,10 @@ void loop() {
                 backlight.setState(true);
             }
             break;
+            delay(1000);
 
         case ACTIVITY_LOW:
-            /* code */
+            delay(10);
             break;
 
         default:
@@ -398,7 +502,7 @@ void render() {
     int etcSegmentHeight  = 16;
     u8g2.drawFrame(x, 0, etcWidth, 64);
     drawETCTemp(x, 0, etcWidth, etcSegmentHeight, "Kamil ", Data3);
-    drawETCTemp(x, etcSegmentHeight, etcWidth, etcSegmentHeight, "Magda", Data4, 1);
+    drawETCTemp(x, etcSegmentHeight - 1, etcWidth, etcSegmentHeight, "Magda", Data4, 1);
     // drawETCTemp(x, 2 * etcSegmentHeight, etcWidth, etcSegmentHeight, "Kuchnia", 21.2f);
 
     u8g2.sendBuffer();

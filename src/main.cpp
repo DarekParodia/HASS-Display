@@ -29,6 +29,9 @@
 
 #define DATA_PRIMARY_TOPIC   "GreenThing/27B529/CO/temperature"
 #define DATA_SECONDARY_TOPIC "GreenThing/27B529/CWU/temperature"
+#define DATA3_TOPIC          "wled/62fad8/temperature"
+#define DATA4_TOPIC          "wled/b47157/temperature"
+
 
 enum ActivityState {
     ACTIVITY_LOW,
@@ -100,6 +103,9 @@ float                              PrimaryDelta            = 10.0f;
 float                              SecondaryDelta          = -10.0f;
 float                              PrimaryDeltaThreshold   = 0.1f;
 float                              SecondaryDeltaThreshold = 0.1f;
+
+float                              Data3                   = 0.0f;
+float                              Data4                   = 0.0f;
 
 U8G2_ST7565_NHD_C12864_F_4W_SW_SPI u8g2(U8G2_R0,
 /* clock=*/LCD_CLOCK,
@@ -223,6 +229,8 @@ void setup() {
 
     mqtt.subscribe(DATA_PRIMARY_TOPIC);
     mqtt.subscribe(DATA_SECONDARY_TOPIC);
+    mqtt.subscribe(DATA3_TOPIC);
+    mqtt.subscribe(DATA4_TOPIC);
 
     // send states
     backlight.setState(config.LCD_BACKLIGHT_VAL > 0);
@@ -251,6 +259,15 @@ void loop() {
     }
 
     delay(1000);
+}
+
+int getTextWidth(const char *text, int charWidth, int spacing) {
+    int width = 0;
+    while(*text) {
+        width += charWidth + spacing;
+        text++;
+    }
+    return width;
 }
 
 void drawTextWithSpacing(int x, int y, const char *text, int spacing) {
@@ -287,6 +304,17 @@ void drawArrow(int x, int y, int size, bool up) {
         u8g2.drawLine(x, y, x + size / 2, y + size);
         u8g2.drawLine(x + size / 2, y + size, x + size, y);
     }
+}
+
+void drawETCTemp(int x, int y, int width, int height, std::string label, float temp, int labelXOffset = 0) {
+    u8g2.drawFrame(x, y, width, height);
+
+    u8g2.setFont(FONT_SMALL);
+    int xOff = 2 + labelXOffset;
+    int yOff = height - 4;
+    drawTextWithSpacing(x + xOff, y + yOff, label.c_str(), 0);
+
+    drawFloat(x + width - 30, y + yOff, temp, 1, -1, FONT_SMALL, FONT_SMALL);
 }
 
 void render() {
@@ -335,7 +363,17 @@ void render() {
         if(-SecondaryDelta >= SecondaryDeltaThreshold)
             drawArrow(arrowX, cwuLabelY + arrowOffsetY, size, false);
     }
+    x                    += tempWidth;
 
+    // Draw ETC Border
+    int etcOffsetX        = -2;
+    x                    += etcOffsetX;
+    int etcWidth          = 128 - x;
+    int etcSegmentHeight  = 16;
+    u8g2.drawFrame(x, 0, etcWidth, 64);
+    drawETCTemp(x, 0, etcWidth, etcSegmentHeight, "Kamil ", Data3);
+    drawETCTemp(x, etcSegmentHeight, etcWidth, etcSegmentHeight, "Magda", Data4, 1);
+    // drawETCTemp(x, 2 * etcSegmentHeight, etcWidth, etcSegmentHeight, "Kuchnia", 21.2f);
 
     u8g2.sendBuffer();
 }
@@ -385,4 +423,8 @@ void onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length) {
         PrimaryData = std::stof(std::string((const char *) payload, length));
     else if(strcmp(topic, DATA_SECONDARY_TOPIC) == 0)
         SecondaryData = std::stof(std::string((const char *) payload, length));
+    else if(strcmp(topic, DATA3_TOPIC) == 0)
+        Data3 = std::stof(std::string((const char *) payload, length));
+    else if(strcmp(topic, DATA4_TOPIC) == 0)
+        Data4 = std::stof(std::string((const char *) payload, length));
 }

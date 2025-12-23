@@ -4,6 +4,9 @@
 #include <U8g2lib.h>
 #include <WiFiManager.h>
 #include <LittleFS.h>
+#include <sstream>
+#include <iomanip>
+#include <string>
 
 #define LCD_CLOCK            1
 #define LCD_DATA             0
@@ -17,6 +20,10 @@
 #define FONT_BIG             u8g2_font_t0_40_tf // 23 pixels high
 #define FONT_MEDIUM          u8g2_font_t0_22_tf // 13 pixels high
 #define FONT_SMALL           u8g2_font_t0_13_tf // 9 pixels high
+#define FONT_TINY            u8g2_font_tiny5_tf // 7 pixels high
+
+#define FONT_PRIMARY_DATA    u8g2_font_luRS18_tn // 18 pixels high
+#define FONT_SECONDARY_DATA  FONT_MEDIUM
 
 #define DEVICE_NAME          "HASS-Display"
 
@@ -85,7 +92,14 @@ settings                           config = {};
 HALight                            backlight("light", HALight::BrightnessFeature);
 HANumber                           contrast("number");
 
-ActivityState                      currentActivityState = ACTIVITY_HIGH;
+ActivityState                      currentActivityState    = ACTIVITY_HIGH;
+
+float                              PrimaryData             = 0.0f;
+float                              SecondaryData           = 0.0f;
+float                              PrimaryDelta            = 10.0f;
+float                              SecondaryDelta          = -10.0f;
+float                              PrimaryDeltaThreshold   = 0.1f;
+float                              SecondaryDeltaThreshold = 0.1f;
 
 U8G2_ST7565_NHD_C12864_F_4W_SW_SPI u8g2(U8G2_R0,
 /* clock=*/LCD_CLOCK,
@@ -105,6 +119,7 @@ void onLCDBrightnessCommand(uint8_t brightness, HALight *sender);
 void onContrastCommand(HANumeric value, HANumber *sender);
 void onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length);
 void render();
+void drawTextWithSpacing(int x, int y, const char *text, int spacing);
 //
 void setup() {
     // Configure LEDC PWM and attach GPIO 21
@@ -202,8 +217,12 @@ void setup() {
     contrast.onCommand(onContrastCommand);
     contrast.setOptimistic(true);
 
+    mqtt.onMessage(onMqttMessage);
     mqtt.begin(config.mqtt_server, config.mqtt_user, config.mqtt_password);
     mqtt.loop();
+
+    mqtt.subscribe(DATA_PRIMARY_TOPIC);
+    mqtt.subscribe(DATA_SECONDARY_TOPIC);
 
     // send states
     backlight.setState(config.LCD_BACKLIGHT_VAL > 0);
@@ -234,27 +253,93 @@ void loop() {
     delay(1000);
 }
 
+void drawTextWithSpacing(int x, int y, const char *text, int spacing) {
+    u8g2.setCursor(x, y);
+
+    while(*text) {
+        char c[2] = { *text++, '\0' };
+        u8g2.print(c);
+        u8g2.setCursor(u8g2.getCursorX() + spacing, y);
+    }
+}
+void drawFloat(int x, int y, float value, int decimalPlaces, int spacing, const uint8_t *fontPrimary = FONT_PRIMARY_DATA, const uint8_t *fontSecondary = FONT_SMALL) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.*f", decimalPlaces, value);
+    char *dot = strchr(buf, '.');
+    if(dot) *dot = '\0'; // terminate integer part
+    // Draw integer part (big font)
+    u8g2.setFont(fontPrimary);
+    drawTextWithSpacing(x, y, buf, spacing);
+
+    x = u8g2.getCursorX();
+    if(dot) {
+        u8g2.setFont(fontSecondary);
+        drawTextWithSpacing(x, y, ".", 0);
+        x = u8g2.getCursorX();
+        drawTextWithSpacing(x, y, dot + 1, spacing); // decimal digits only
+    }
+}
+void drawArrow(int x, int y, int size, bool up) {
+    if(up) {
+        u8g2.drawLine(x, y + size, x + size / 2, y);
+        u8g2.drawLine(x + size / 2, y, x + size, y + size);
+    } else {
+        u8g2.drawLine(x, y, x + size / 2, y + size);
+        u8g2.drawLine(x + size / 2, y + size, x + size, y);
+    }
+}
+
 void render() {
     u8g2.clearBuffer();
 
-    u8g2.setFont(FONT_MEDIUM);
-    u8g2.drawStr(0, 15, "HASS-Display");
+    int x               = 0;
+    int coY             = 28;
+    int cwuY            = 61;
+    int spacing         = -2;
+    int labelSpacing    = 1;
+    int labelHeight     = 10;
+    int labelMarginLeft = 2;
+    int tempWidth       = 45;
 
-    u8g2.setFont(FONT_SMALL);
-    u8g2.drawStr(0, 35, "Backlight:");
-    char buf[5];
-    snprintf(buf, sizeof(buf), "%d", config.LCD_BACKLIGHT_VAL);
-    u8g2.drawStr(80, 35, buf);
+    // Draw Temps Border
+    u8g2.drawFrame(x, 0, tempWidth, 64);
+    x             += 1;
 
-    u8g2.drawStr(0, 50, "Contrast:");
-    snprintf(buf, sizeof(buf), "%d", config.LCD_CONTRAST_VAL);
-    u8g2.drawStr(80, 50, buf);
+    // Draw Temps
+    int coLabelY   = coY - labelHeight - 10;
+    int cwuLabelY  = cwuY;
+    u8g2.setFont(FONT_TINY);
+    drawTextWithSpacing(x + labelMarginLeft, coLabelY, "CO", labelSpacing);
+    drawTextWithSpacing(x + labelMarginLeft, cwuY, "CWU", labelSpacing);
 
-    // Button
-    u8g2.drawStr(0, 63, digitalRead(BUTTON1_PIN) == HIGH ? "Button: OFF" : "Button: ON");
+    drawFloat(x, coY, PrimaryData, 1, spacing);
+    drawFloat(x, cwuY - labelHeight, SecondaryData, 1, spacing);
+
+    // Draw Arrows
+    int size         = 4;
+    int arrowX       = tempWidth - size - 4;
+    int arrowOffsetY = -5;
+
+    if(PrimaryDelta > 0) {
+        if(PrimaryDelta >= PrimaryDeltaThreshold)
+            drawArrow(arrowX, coLabelY + arrowOffsetY, size, true);
+    } else {
+        if(-PrimaryDelta >= PrimaryDeltaThreshold)
+            drawArrow(arrowX, coLabelY + arrowOffsetY, size, false);
+    }
+
+    if(SecondaryDelta > 0) {
+        if(SecondaryDelta >= SecondaryDeltaThreshold)
+            drawArrow(arrowX, cwuLabelY + arrowOffsetY, size, true);
+    } else {
+        if(-SecondaryDelta >= SecondaryDeltaThreshold)
+            drawArrow(arrowX, cwuLabelY + arrowOffsetY, size, false);
+    }
+
 
     u8g2.sendBuffer();
 }
+
 
 void setBacklight(uint8_t brightness) {
     analogWrite(LCD_BACKLIGHT, brightness);
@@ -290,5 +375,14 @@ void onContrastCommand(HANumeric value, HANumber *sender) {
 }
 
 void onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length) {
+    Serial.print("MQTT Message received on topic: ");
+    Serial.print(topic);
+    Serial.print(" with payload: ");
+    Serial.write(payload, length);
+    Serial.println();
     // Handle incoming MQTT messages if needed
+    if(strcmp(topic, DATA_PRIMARY_TOPIC) == 0)
+        PrimaryData = std::stof(std::string((const char *) payload, length));
+    else if(strcmp(topic, DATA_SECONDARY_TOPIC) == 0)
+        SecondaryData = std::stof(std::string((const char *) payload, length));
 }

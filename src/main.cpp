@@ -32,6 +32,8 @@
 #define DATA3_TOPIC          "wled/62fad8/temperature"
 #define DATA4_TOPIC          "wled/b47157/temperature"
 
+#define BACKLIGHT_TIME       15000 // ms
+
 
 enum ActivityState {
     ACTIVITY_LOW,
@@ -116,22 +118,36 @@ U8G2_ST7565_NHD_C12864_F_4W_SW_SPI u8g2(U8G2_R0,
 
 
 // functions
-void setBacklight(uint8_t brightness);
-void setContrast(uint8_t contrast);
+void           setBacklight(uint8_t brightness);
+void           setContrast(uint8_t contrast);
 
-void onLCDStateCommand(bool state, HALight *sender);
-void onLCDBrightnessCommand(uint8_t brightness, HALight *sender);
+void           onLCDStateCommand(bool state, HALight *sender);
+void           onLCDBrightnessCommand(uint8_t brightness, HALight *sender);
 
-void onContrastCommand(HANumeric value, HANumber *sender);
-void onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length);
-void render();
-void drawTextWithSpacing(int x, int y, const char *text, int spacing);
+void           onContrastCommand(HANumeric value, HANumber *sender);
+void           onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length);
+void           render();
+void           drawTextWithSpacing(int x, int y, const char *text, int spacing);
+void IRAM_ATTR buttonISR();
 //
+volatile unsigned long lastButtonInterruptTime = 0;
+const unsigned long    BUTTON_DEBOUNCE_MS      = 200;
+
+void IRAM_ATTR         buttonISR() {
+    unsigned long currentTime = millis();
+    if((currentTime - lastButtonInterruptTime) > BUTTON_DEBOUNCE_MS) {
+        currentActivityState    = ACTIVITY_HIGH;
+        lastButtonInterruptTime = currentTime;
+        setBacklight(config.LCD_BACKLIGHT_VAL);
+    }
+}
+
 void setup() {
     // Configure LEDC PWM and attach GPIO 21
     Serial.begin(115200);
     pinMode(LCD_BACKLIGHT, OUTPUT);
-    pinMode(BUTTON1_PIN, INPUT);
+    pinMode(BUTTON1_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BUTTON1_PIN), buttonISR, RISING);
 
     // Try mounting
     if(!LittleFS.begin()) {
@@ -238,16 +254,30 @@ void setup() {
 
     contrast.setState(static_cast<float>(config.LCD_CONTRAST_VAL));
 
+    WiFi.setSleep(true); // Enable WiFi sleep to save power
+
     mqtt.loop();
+
+    Serial.println("Button interrupt initialized on GPIO 20");
 }
 
 void loop() {
     mqtt.loop();
+    delay(1000);
     render();
+
+    long currentTime = millis();
 
     switch(currentActivityState) {
         case ACTIVITY_HIGH:
-            /* code */
+            if((currentTime - lastButtonInterruptTime) > BACKLIGHT_TIME) {
+                currentActivityState = ACTIVITY_LOW;
+                // Turn off backlight
+                setBacklight(0);
+                backlight.setState(false);
+            } else {
+                backlight.setState(true);
+            }
             break;
 
         case ACTIVITY_LOW:
@@ -257,8 +287,6 @@ void loop() {
         default:
             break;
     }
-
-    delay(1000);
 }
 
 int getTextWidth(const char *text, int charWidth, int spacing) {
@@ -269,7 +297,6 @@ int getTextWidth(const char *text, int charWidth, int spacing) {
     }
     return width;
 }
-
 void drawTextWithSpacing(int x, int y, const char *text, int spacing) {
     u8g2.setCursor(x, y);
 
@@ -305,7 +332,6 @@ void drawArrow(int x, int y, int size, bool up) {
         u8g2.drawLine(x + size / 2, y + size, x + size, y);
     }
 }
-
 void drawETCTemp(int x, int y, int width, int height, std::string label, float temp, int labelXOffset = 0) {
     u8g2.drawFrame(x, y, width, height);
 
@@ -395,12 +421,16 @@ void onLCDStateCommand(bool state, HALight *sender) {
         // Turn off backlight
         setBacklight(0);
     }
+    currentActivityState    = ACTIVITY_HIGH;
+    lastButtonInterruptTime = millis();
     sender->setState(state); // Update state
 }
 void onLCDBrightnessCommand(uint8_t brightness, HALight *sender) {
     config.LCD_BACKLIGHT_VAL = brightness;
     setBacklight(brightness);
     config.saveToFS();
+    currentActivityState    = ACTIVITY_HIGH;
+    lastButtonInterruptTime = millis();
     sender->setBrightness(brightness); // Update brightness
 }
 
@@ -409,6 +439,8 @@ void onContrastCommand(HANumeric value, HANumber *sender) {
     config.LCD_CONTRAST_VAL = contrastValue;
     setContrast(contrastValue);
     config.saveToFS();
+    currentActivityState    = ACTIVITY_HIGH;
+    lastButtonInterruptTime = millis();
     sender->setState(value); // Update state
 }
 

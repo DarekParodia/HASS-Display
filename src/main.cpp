@@ -120,12 +120,18 @@ const long                         BUTTON_LONGPRESS_TIME   = 500; // ms
 
 ActivityState                      currentActivityState    = ACTIVITY_HIGH;
 
+const float                        DELTA_TIME_DIVIDER      = 1000.0f * 60.0f; // to convert ms to seconds
+
 float                              PrimaryData             = 0.0f;
 float                              SecondaryData           = 0.0f;
-float                              PrimaryDelta            = 10.0f;
-float                              SecondaryDelta          = -10.0f;
+float                              PrimaryDelta            = 0.0f;
+float                              SecondaryDelta          = 0.0f;
 float                              PrimaryDeltaThreshold   = 0.1f;
 float                              SecondaryDeltaThreshold = 0.1f;
+float                              lastPrimaryData         = 0.0f;
+float                              lastSecondaryData       = 0.0f;
+long                               lastPrimaryDataTime     = 0;
+long                               lastSecondaryDataTime   = 0;
 
 float                              Data3                   = 0.0f;
 float                              Data4                   = 0.0f;
@@ -555,11 +561,30 @@ void onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length) {
     Serial.write(payload, length);
     Serial.println();
     // Handle incoming MQTT messages if needed
-    if(strcmp(topic, DATA_PRIMARY_TOPIC) == 0)
-        PrimaryData = std::stof(std::string((const char *) payload, length));
-    else if(strcmp(topic, DATA_SECONDARY_TOPIC) == 0)
-        SecondaryData = std::stof(std::string((const char *) payload, length));
-    else if(strcmp(topic, DATA3_TOPIC) == 0)
+    long currentTime = millis();
+    if(strcmp(topic, DATA_PRIMARY_TOPIC) == 0) {
+        lastPrimaryData     = PrimaryData;
+        PrimaryData         = std::stof(std::string((const char *) payload, length));
+
+        // Calculate delta
+        float timeDeltaSec  = (currentTime - lastPrimaryDataTime) / DELTA_TIME_DIVIDER;
+        PrimaryDelta        = (PrimaryData - lastPrimaryData) / timeDeltaSec;
+
+        lastPrimaryDataTime = currentTime;
+        Serial.print("Primary Delta: ");
+        Serial.println(PrimaryDelta);
+    } else if(strcmp(topic, DATA_SECONDARY_TOPIC) == 0) {
+        lastSecondaryData     = SecondaryData;
+        SecondaryData         = std::stof(std::string((const char *) payload, length));
+
+        // Calculate delta
+        float timeDeltaSec    = (currentTime - lastSecondaryDataTime) / DELTA_TIME_DIVIDER;
+        SecondaryDelta        = (SecondaryData - lastSecondaryData) / timeDeltaSec;
+
+        lastSecondaryDataTime = currentTime;
+        Serial.print("Secondary Delta: ");
+        Serial.println(SecondaryDelta);
+    } else if(strcmp(topic, DATA3_TOPIC) == 0)
         Data3 = std::stof(std::string((const char *) payload, length));
     else if(strcmp(topic, DATA4_TOPIC) == 0)
         Data4 = std::stof(std::string((const char *) payload, length));

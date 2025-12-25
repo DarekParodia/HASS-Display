@@ -4,9 +4,11 @@
 #include <U8g2lib.h>
 #include <WiFiManager.h>
 #include <LittleFS.h>
+#include <time.h>
 #include <sstream>
 #include <iomanip>
 #include <string>
+#include <AccelStepper.h>
 
 #define LCD_CLOCK            1
 #define LCD_DATA             0
@@ -36,20 +38,37 @@
 
 #define BACKLIGHT_TIME       15000 // ms
 
+// NTP Configuration
+#define NTP_SERVER           "pool.ntp.org"
+#define GMT_OFFSET_SEC       3600 // GMT+1 (adjust for your timezone)
+#define DAYLIGHT_OFFSET_SEC  3600 // Daylight saving time offset
+
+#define EN_PIN               6
+#define STEP_PIN             7
+#define STEPPER_MICROSTEPS   16
+#define STEPS_PER_REV        (200 * STEPPER_MICROSTEPS) // 200 full steps per revolution
 
 enum ActivityState {
     ACTIVITY_LOW,
-    ACTIVITY_HIGH
+    ACTIVITY_HIGH,
+    ACTIVITY_STEPPER
 };
 
 struct settings {
-        char    mqtt_server[64]   = "";
-        int     mqtt_port         = 1883;
-        char    mqtt_user[64]     = "";
-        char    mqtt_password[64] = "";
+        char    mqtt_server[64]     = "";
+        int     mqtt_port           = 1883;
+        char    mqtt_user[64]       = "";
+        char    mqtt_password[64]   = "";
 
-        uint8_t LCD_CONTRAST_VAL  = 128;
-        uint8_t LCD_BACKLIGHT_VAL = 128;
+        uint8_t LCD_CONTRAST_VAL    = 128;
+        uint8_t LCD_BACKLIGHT_VAL   = 128;
+
+        int     StepperSpeed        = 10;
+        int     StepperAccel        = 20;
+        int     GramsFeededToday    = 0;
+        float   RotationsPerFeeding = 1.0f;
+        float   GramsPerFeeding     = 1.0f;
+        float   MaxGramsPerDay      = 100.0f;
 
         void    saveToFS() {
             File file = LittleFS.open("/settings.bin", "w");
@@ -93,11 +112,24 @@ WiFiManager                        wifiManager;
 WiFiClient                         client;
 HADevice                           device(DEVICE_NAME);
 HAMqtt                             mqtt(client, device);
+AccelStepper                       stepper(AccelStepper::DRIVER, STEP_PIN, 8);
 
-settings                           config = {};
+hw_timer_t                        *stepperTimer = NULL;
+portMUX_TYPE                       stepperMux   = portMUX_INITIALIZER_UNLOCKED;
 
-HALight                            backlight("light", HALight::BrightnessFeature);
-HANumber                           contrast("number");
+settings                           config       = {};
+
+HALight                            backlight("backlight", HALight::BrightnessFeature);
+HANumber                           contrast("contrast", HABaseDeviceType::PrecisionP0);
+HANumber                           stepperSpeed("stepper_speed", HABaseDeviceType::PrecisionP0);
+HANumber                           stepperAccel("stepper_accel", HABaseDeviceType::PrecisionP0);
+HANumber                           rotationsPerFeeding("rotations_per_feeding", HABaseDeviceType::PrecisionP2);
+HANumber                           gramsPerFeeding("grams_per_feeding", HABaseDeviceType::PrecisionP2);
+HANumber                           maxGramsPerDay("max_grams_per_day", HABaseDeviceType::PrecisionP2);
+
+HASensorNumber                     gramsFedTodaySensor("grams_fed_today");
+
+HAButton                           feedNowButton("feed_now");
 
 HADeviceTrigger                    trigger1short(HADeviceTrigger::ButtonShortPressType, "btn1");
 HADeviceTrigger                    trigger1long(HADeviceTrigger::ButtonLongPressType, "btn1");
@@ -117,7 +149,6 @@ const unsigned long                BUTTON_DEBOUNCE_TIME    = 50; // ms
 
 const long                         BUTTON_LONGPRESS_TIME   = 500; // ms
 
-
 ActivityState                      currentActivityState    = ACTIVITY_HIGH;
 
 const float                        DELTA_TIME_DIVIDER      = 1000.0f * 60.0f; // to convert ms to seconds
@@ -126,8 +157,8 @@ float                              PrimaryData             = 0.0f;
 float                              SecondaryData           = 0.0f;
 float                              PrimaryDelta            = 0.0f;
 float                              SecondaryDelta          = 0.0f;
-float                              PrimaryDeltaThreshold   = 0.1f;
-float                              SecondaryDeltaThreshold = 0.1f;
+float                              PrimaryDeltaThreshold   = 0.15f;
+float                              SecondaryDeltaThreshold = 0.15f;
 float                              lastPrimaryData         = 0.0f;
 float                              lastSecondaryData       = 0.0f;
 long                               lastPrimaryDataTime     = 0;
@@ -135,6 +166,8 @@ long                               lastSecondaryDataTime   = 0;
 
 float                              Data3                   = 0.0f;
 float                              Data4                   = 0.0f;
+
+int                                lastDay                 = -1; // Track last known day for new day detection
 
 U8G2_ST7565_NHD_C12864_F_4W_SW_SPI u8g2(U8G2_R0,
 /* clock=*/LCD_CLOCK,
@@ -152,10 +185,21 @@ void           onLCDStateCommand(bool state, HALight *sender);
 void           onLCDBrightnessCommand(uint8_t brightness, HALight *sender);
 
 void           onContrastCommand(HANumeric value, HANumber *sender);
+void           onStepperSpeedCommand(HANumeric value, HANumber *sender);
+void           onStepperAccelCommand(HANumeric value, HANumber *sender);
+void           onRotationsPerFeedingCommand(HANumeric value, HANumber *sender);
+void           onGramsPerFeedingCommand(HANumeric value, HANumber *sender);
+void           onMaxGramsPerDayCommand(HANumeric value, HANumber *sender);
+void           onFeedNowCommand(HAButton *sender);
 void           onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length);
 void           render();
+void           feedNow();
+void           stepperLoop();
+void IRAM_ATTR onStepperTimer();
 void           drawTextWithSpacing(int x, int y, const char *text, int spacing);
 void IRAM_ATTR buttonISR();
+void           setupNTP();
+void           checkNewDay();
 //
 volatile unsigned long lastButtonInterruptTime = 0;
 const unsigned long    BUTTON_DEBOUNCE_MS      = 200;
@@ -228,7 +272,10 @@ void serviceCheck() {
 void setup() {
     // Configure LEDC PWM and attach GPIO 21
     Serial.begin(115200);
+
     pinMode(LCD_BACKLIGHT, OUTPUT);
+    pinMode(EN_PIN, OUTPUT);
+
     pinMode(BUTTON1_PIN, INPUT_PULLUP);
     pinMode(BUTTON2_PIN, INPUT_PULLDOWN);
     pinMode(BUTTON3_PIN, INPUT_PULLDOWN);
@@ -246,6 +293,11 @@ void setup() {
         Serial.println("LittleFS mounted successfully.");
     }
     config.loadFromFS();
+
+    // Setup stepper motor
+    digitalWrite(EN_PIN, HIGH); // Disable the stepper driver
+    stepper.setMaxSpeed(config.StepperSpeed * STEPPER_MICROSTEPS);
+    stepper.setAcceleration(config.StepperAccel * STEPPER_MICROSTEPS);
 
     // Initialize the display
     u8g2.begin();
@@ -295,6 +347,8 @@ void setup() {
     u8g2.drawStr(0, 30, WiFi.localIP().toString().c_str());
     u8g2.sendBuffer();
 
+    // Initialize NTP time sync
+    setupNTP();
 
     strncpy(config.mqtt_server, mqtt_server_param->getValue(), sizeof(config.mqtt_server));
     config.mqtt_server[sizeof(config.mqtt_server) - 1] = '\0';
@@ -327,6 +381,66 @@ void setup() {
     contrast.onCommand(onContrastCommand);
     contrast.setOptimistic(true);
 
+    // Setup Stepper Speed
+    stepperSpeed.setName("Stepper Speed");
+    stepperSpeed.setIcon("mdi:speedometer");
+    stepperSpeed.setMode(HANumber::ModeSlider);
+    stepperSpeed.setMin(1.0f);
+    stepperSpeed.setMax(100.0f);
+    stepperSpeed.setStep(1.0f);
+    stepperSpeed.onCommand(onStepperSpeedCommand);
+    stepperSpeed.setOptimistic(true);
+
+    // Setup Stepper Acceleration
+    stepperAccel.setName("Stepper Acceleration");
+    stepperAccel.setIcon("mdi:run-fast");
+    stepperAccel.setMode(HANumber::ModeSlider);
+    stepperAccel.setMin(1.0f);
+    stepperAccel.setMax(100.0f);
+    stepperAccel.setStep(1.0f);
+    stepperAccel.onCommand(onStepperAccelCommand);
+    stepperAccel.setOptimistic(true);
+
+    // Setup Rotations Per Feeding
+    rotationsPerFeeding.setName("Rotations Per Feeding");
+    rotationsPerFeeding.setIcon("mdi:rotate-right");
+    rotationsPerFeeding.setMode(HANumber::ModeBox);
+    rotationsPerFeeding.setMin(0.01f);
+    rotationsPerFeeding.setMax(10.0f);
+    rotationsPerFeeding.setStep(0.01f);
+    rotationsPerFeeding.onCommand(onRotationsPerFeedingCommand);
+    rotationsPerFeeding.setOptimistic(true);
+
+    // Setup Grams Per Feeding
+    gramsPerFeeding.setName("Grams Per Feeding");
+    gramsPerFeeding.setIcon("mdi:weight-gram");
+    gramsPerFeeding.setMode(HANumber::ModeBox);
+    gramsPerFeeding.setMin(0.01f);
+    gramsPerFeeding.setMax(100.0f);
+    gramsPerFeeding.setStep(0.01f);
+    gramsPerFeeding.onCommand(onGramsPerFeedingCommand);
+    gramsPerFeeding.setOptimistic(true);
+
+    // Setup Max Grams Per Day
+    maxGramsPerDay.setName("Max Grams Per Day");
+    maxGramsPerDay.setIcon("mdi:scale");
+    maxGramsPerDay.setMode(HANumber::ModeBox);
+    maxGramsPerDay.setMin(1.0f);
+    maxGramsPerDay.setMax(500.0f);
+    maxGramsPerDay.setStep(0.01f);
+    maxGramsPerDay.onCommand(onMaxGramsPerDayCommand);
+    maxGramsPerDay.setOptimistic(true);
+
+    // Setup Feed Now Button
+    feedNowButton.setName("Feed Now");
+    feedNowButton.setIcon("mdi:food");
+    feedNowButton.onCommand(onFeedNowCommand);
+
+    // Grams Fed Today Sensor
+    gramsFedTodaySensor.setName("Grams Fed Today");
+    gramsFedTodaySensor.setIcon("mdi:counter");
+    gramsFedTodaySensor.setUnitOfMeasurement("g");
+
     mqtt.onMessage(onMqttMessage);
     mqtt.begin(config.mqtt_server, config.mqtt_user, config.mqtt_password);
     mqtt.loop();
@@ -342,11 +456,36 @@ void setup() {
 
     contrast.setState(static_cast<float>(config.LCD_CONTRAST_VAL));
 
+    stepperSpeed.setState(static_cast<float>(config.StepperSpeed));
+    stepperAccel.setState(static_cast<float>(config.StepperAccel));
+    rotationsPerFeeding.setState(config.RotationsPerFeeding);
+    gramsPerFeeding.setState(config.GramsPerFeeding);
+    maxGramsPerDay.setState(config.MaxGramsPerDay);
+
     mqtt.loop();
 
     // enable light sleep
     WiFi.setSleep(true);                // This is light sleep, not deep sleep
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM); // Minimal power saving
+
+    // Setup hardware timer for stepper (timer 0, 80 divider = 1MHz, count up)
+    stepperTimer = timerBegin(0, 80, true);                    // Timer 0, prescaler 80 (1MHz), count up
+    timerAttachInterrupt(stepperTimer, &onStepperTimer, true); // Edge triggered
+    timerAlarmWrite(stepperTimer, 50, true);                   // 50us interval = 20kHz, auto-reload
+    timerAlarmEnable(stepperTimer);                            // Start the timer
+}
+
+void IRAM_ATTR onStepperTimer() {
+    portENTER_CRITICAL_ISR(&stepperMux);
+    if(stepper.isRunning())
+        stepper.run();
+    portEXIT_CRITICAL_ISR(&stepperMux);
+}
+
+void stepperLoop() {
+    // Check if stepper finished and disable driver
+    if(!stepper.isRunning())
+        digitalWrite(EN_PIN, HIGH); // Disable the stepper driver
 }
 
 void loop() {
@@ -374,12 +513,14 @@ void loop() {
     render();
     mqtt.loop();
     serviceCheck();
+    stepperLoop(); // Check if stepper finished
+    checkNewDay(); // Check if a new day has started
 
     long currentTime = millis();
 
     switch(currentActivityState) {
         case ACTIVITY_HIGH:
-            if((currentTime - lastButtonInterruptTime) > BACKLIGHT_TIME) {
+            if((currentTime - lastButtonInterruptTime) > BACKLIGHT_TIME && currentActivityState != ACTIVITY_STEPPER) {
                 currentActivityState = ACTIVITY_LOW;
                 // Turn off backlight
                 setBacklight(0);
@@ -387,8 +528,9 @@ void loop() {
             } else {
                 backlight.setState(true);
             }
+            if(currentActivityState != ACTIVITY_STEPPER)
+                delay(10);
             break;
-            delay(1000);
 
         case ACTIVITY_LOW:
             delay(10);
@@ -509,11 +651,25 @@ void render() {
     u8g2.drawFrame(x, 0, etcWidth, 64);
     drawETCTemp(x, 0, etcWidth, etcSegmentHeight, "Kamil ", Data3);
     drawETCTemp(x, etcSegmentHeight - 1, etcWidth, etcSegmentHeight, "Magda", Data4, 1);
+    drawETCTemp(x, 2 * etcSegmentHeight - 2, etcWidth, etcSegmentHeight, "CO/m", PrimaryDelta);
+    drawETCTemp(x, 3 * etcSegmentHeight - 3, etcWidth, etcSegmentHeight, "CWU/m", SecondaryDelta);
     // drawETCTemp(x, 2 * etcSegmentHeight, etcWidth, etcSegmentHeight, "Kuchnia", 21.2f);
 
     u8g2.sendBuffer();
 }
 
+void feedNow() {
+    Serial.println("Feeding now...");
+    long stepsToMove = static_cast<long>(((float) STEPS_PER_REV * config.RotationsPerFeeding) * 1000.0f) / 1000;
+    stepper.move(stepsToMove);
+    digitalWrite(EN_PIN, LOW); // Enable the stepper driver
+    currentActivityState     = ACTIVITY_STEPPER;
+
+    // Update grams feeded today
+    config.GramsFeededToday += static_cast<int>(config.GramsPerFeeding);
+    gramsFedTodaySensor.setValue(static_cast<float>(config.GramsFeededToday));
+    config.saveToFS();
+}
 
 void setBacklight(uint8_t brightness) {
     analogWrite(LCD_BACKLIGHT, brightness);
@@ -554,6 +710,42 @@ void onContrastCommand(HANumeric value, HANumber *sender) {
     sender->setState(value); // Update state
 }
 
+void onStepperSpeedCommand(HANumeric value, HANumber *sender) {
+    config.StepperSpeed = value.toInt16();
+    config.saveToFS();
+    stepper.setMaxSpeed(config.StepperSpeed * STEPPER_MICROSTEPS);
+    sender->setState(value);
+}
+
+void onStepperAccelCommand(HANumeric value, HANumber *sender) {
+    config.StepperAccel = value.toInt16();
+    config.saveToFS();
+    stepper.setAcceleration(config.StepperAccel * STEPPER_MICROSTEPS);
+    sender->setState(value);
+}
+
+void onRotationsPerFeedingCommand(HANumeric value, HANumber *sender) {
+    config.RotationsPerFeeding = value.toFloat();
+    config.saveToFS();
+    sender->setState(value);
+}
+
+void onGramsPerFeedingCommand(HANumeric value, HANumber *sender) {
+    config.GramsPerFeeding = value.toFloat();
+    config.saveToFS();
+    sender->setState(value);
+}
+
+void onMaxGramsPerDayCommand(HANumeric value, HANumber *sender) {
+    config.MaxGramsPerDay = value.toFloat();
+    config.saveToFS();
+    sender->setState(value);
+}
+
+void onFeedNowCommand(HAButton *sender) {
+    feedNow();
+}
+
 void onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length) {
     Serial.print("MQTT Message received on topic: ");
     Serial.print(topic);
@@ -588,4 +780,52 @@ void onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length) {
         Data3 = std::stof(std::string((const char *) payload, length));
     else if(strcmp(topic, DATA4_TOPIC) == 0)
         Data4 = std::stof(std::string((const char *) payload, length));
+}
+
+// NTP Setup - Syncs time from the internet
+void setupNTP() {
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    Serial.println("Waiting for NTP time sync...");
+
+    // Wait for time to be set (with timeout)
+    int retries = 0;
+    while(time(nullptr) < 1000000000 && retries < 20) {
+        delay(500);
+        Serial.print(".");
+        retries++;
+    }
+    Serial.println();
+
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo)) {
+        Serial.println("NTP time synchronized!");
+        Serial.printf("Current time: %02d:%02d:%02d, Day: %d\n",
+        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, timeinfo.tm_mday);
+        lastDay = timeinfo.tm_mday; // Initialize lastDay
+    } else {
+        Serial.println("Failed to get NTP time");
+    }
+}
+
+// Check if a new day has started and reset daily counters
+void checkNewDay() {
+    struct tm timeinfo;
+    if(!getLocalTime(&timeinfo))
+        return; // Time not available yet
+
+    int currentDay = timeinfo.tm_mday;
+
+    // Check if day has changed (and lastDay is valid)
+    if(lastDay != -1 && currentDay != lastDay) {
+        Serial.println("New day detected! Resetting daily counters...");
+
+        // Reset daily grams counter
+        config.GramsFeededToday = 0;
+        gramsFedTodaySensor.setValue(0.0f);
+        config.saveToFS();
+
+        Serial.printf("Daily reset complete. New day: %d\n", currentDay);
+    }
+
+    lastDay = currentDay;
 }

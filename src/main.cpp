@@ -43,6 +43,8 @@
 #define GMT_OFFSET_SEC       3600 // GMT+1 (adjust for your timezone)
 #define DAYLIGHT_OFFSET_SEC  3600 // Daylight saving time offset
 
+#define DELTA_READINGS_COUNT 15 // Number of readings to use for delta calculation
+
 #define EN_PIN               6
 #define STEP_PIN             7
 #define STEPPER_MICROSTEPS   16
@@ -65,9 +67,9 @@ struct settings {
 
         int     StepperSpeed        = 10;
         int     StepperAccel        = 20;
-        int     GramsFeededToday    = 0;
+        float   GramsFeededToday    = 0.0f;
         float   RotationsPerFeeding = 1.0f;
-        float   GramsPerFeeding     = 1.0f;
+        float   GramsPerRotation    = 1.0f;
         float   MaxGramsPerDay      = 100.0f;
 
         void    saveToFS() {
@@ -103,71 +105,83 @@ struct settings {
         }
 };
 
-WiFiManagerParameter              *mqtt_server_param;
-WiFiManagerParameter              *mqtt_port_param;
-WiFiManagerParameter              *mqtt_user_param;
-WiFiManagerParameter              *mqtt_password_param;
-WiFiManager                        wifiManager;
+WiFiManagerParameter  *mqtt_server_param;
+WiFiManagerParameter  *mqtt_port_param;
+WiFiManagerParameter  *mqtt_user_param;
+WiFiManagerParameter  *mqtt_password_param;
+WiFiManager            wifiManager;
 
-WiFiClient                         client;
-HADevice                           device(DEVICE_NAME);
-HAMqtt                             mqtt(client, device);
-AccelStepper                       stepper(AccelStepper::DRIVER, STEP_PIN, 8);
+WiFiClient             client;
+HADevice               device(DEVICE_NAME);
+HAMqtt                 mqtt(client, device);
+AccelStepper           stepper(AccelStepper::DRIVER, STEP_PIN, 8);
 
-hw_timer_t                        *stepperTimer = NULL;
-portMUX_TYPE                       stepperMux   = portMUX_INITIALIZER_UNLOCKED;
+hw_timer_t            *stepperTimer = NULL;
+portMUX_TYPE           stepperMux   = portMUX_INITIALIZER_UNLOCKED;
 
-settings                           config       = {};
+settings               config       = {};
 
-HALight                            backlight("backlight", HALight::BrightnessFeature);
-HANumber                           contrast("contrast", HABaseDeviceType::PrecisionP0);
-HANumber                           stepperSpeed("stepper_speed", HABaseDeviceType::PrecisionP0);
-HANumber                           stepperAccel("stepper_accel", HABaseDeviceType::PrecisionP0);
-HANumber                           rotationsPerFeeding("rotations_per_feeding", HABaseDeviceType::PrecisionP2);
-HANumber                           gramsPerFeeding("grams_per_feeding", HABaseDeviceType::PrecisionP2);
-HANumber                           maxGramsPerDay("max_grams_per_day", HABaseDeviceType::PrecisionP2);
+HALight                backlight("backlight", HALight::BrightnessFeature);
+HANumber               contrast("contrast", HABaseDeviceType::PrecisionP0);
+HANumber               stepperSpeed("stepper_speed", HABaseDeviceType::PrecisionP0);
+HANumber               stepperAccel("stepper_accel", HABaseDeviceType::PrecisionP0);
+HANumber               rotationsPerFeeding("rotations_per_feeding", HABaseDeviceType::PrecisionP2);
+HANumber               gramsPerFeeding("grams_per_feeding", HABaseDeviceType::PrecisionP2);
+HANumber               maxGramsPerDay("max_grams_per_day", HABaseDeviceType::PrecisionP2);
 
-HASensorNumber                     gramsFedTodaySensor("grams_fed_today");
+HASensorNumber         gramsFedTodaySensor("grams_fed_today", HABaseDeviceType::PrecisionP1);
+HASensorNumber         COdelta("co_delta", HABaseDeviceType::PrecisionP2);
+HASensorNumber         CWUdelta("cwu_delta", HABaseDeviceType::PrecisionP2);
 
-HAButton                           feedNowButton("feed_now");
+HAButton               feedNowButton("feed_now");
 
-HADeviceTrigger                    trigger1short(HADeviceTrigger::ButtonShortPressType, "btn1");
-HADeviceTrigger                    trigger1long(HADeviceTrigger::ButtonLongPressType, "btn1");
-bool                               triggered1long  = false;
-bool                               triggered1short = false;
+HADeviceTrigger        trigger1short(HADeviceTrigger::ButtonShortPressType, "btn1");
+HADeviceTrigger        trigger1long(HADeviceTrigger::ButtonLongPressType, "btn1");
+bool                   triggered1long  = false;
+bool                   triggered1short = false;
 
-HADeviceTrigger                    trigger2short(HADeviceTrigger::ButtonShortPressType, "btn2");
-HADeviceTrigger                    trigger2long(HADeviceTrigger::ButtonLongPressType, "btn2");
-bool                               triggered2long          = false;
-bool                               triggered2short         = false;
+HADeviceTrigger        trigger2short(HADeviceTrigger::ButtonShortPressType, "btn2");
+HADeviceTrigger        trigger2long(HADeviceTrigger::ButtonLongPressType, "btn2");
+bool                   triggered2long          = false;
+bool                   triggered2short         = false;
 
-long                               button1PressinTime      = 0;
-long                               button2PressinTime      = 0;
-volatile unsigned long             button1LastDebounce     = 0;
-volatile unsigned long             button2LastDebounce     = 0;
-const unsigned long                BUTTON_DEBOUNCE_TIME    = 50; // ms
+long                   button1PressinTime      = 0;
+long                   button2PressinTime      = 0;
+volatile unsigned long button1LastDebounce     = 0;
+volatile unsigned long button2LastDebounce     = 0;
+const unsigned long    BUTTON_DEBOUNCE_TIME    = 50; // ms
 
-const long                         BUTTON_LONGPRESS_TIME   = 500; // ms
+const long             BUTTON_LONGPRESS_TIME   = 500; // ms
 
-ActivityState                      currentActivityState    = ACTIVITY_HIGH;
+ActivityState          currentActivityState    = ACTIVITY_HIGH;
 
-const float                        DELTA_TIME_DIVIDER      = 1000.0f * 60.0f; // to convert ms to seconds
+const float            DELTA_TIME_DIVIDER      = 1000.0f * 60.0f; // to convert ms to seconds
 
-float                              PrimaryData             = 0.0f;
-float                              SecondaryData           = 0.0f;
-float                              PrimaryDelta            = 0.0f;
-float                              SecondaryDelta          = 0.0f;
-float                              PrimaryDeltaThreshold   = 0.15f;
-float                              SecondaryDeltaThreshold = 0.15f;
-float                              lastPrimaryData         = 0.0f;
-float                              lastSecondaryData       = 0.0f;
-long                               lastPrimaryDataTime     = 0;
-long                               lastSecondaryDataTime   = 0;
+float                  PrimaryData             = 0.0f;
+float                  SecondaryData           = 0.0f;
+float                  PrimaryDelta            = 0.0f;
+float                  SecondaryDelta          = 0.0f;
+float                  PrimaryDeltaThreshold   = 0.15f;
+float                  SecondaryDeltaThreshold = 0.15f;
 
-float                              Data3                   = 0.0f;
-float                              Data4                   = 0.0f;
+// Ring buffers for delta calculation based on multiple readings
+struct DeltaReading {
+        float value;
+        long  timestamp;
+};
 
-int                                lastDay                 = -1; // Track last known day for new day detection
+DeltaReading                       primaryReadings[DELTA_READINGS_COUNT];
+int                                primaryReadingsIndex = 0;
+int                                primaryReadingsCount = 0;
+
+DeltaReading                       secondaryReadings[DELTA_READINGS_COUNT];
+int                                secondaryReadingsIndex = 0;
+int                                secondaryReadingsCount = 0;
+
+float                              Data3                  = 0.0f;
+float                              Data4                  = 0.0f;
+
+int                                lastDay                = -1; // Track last known day for new day detection
 
 U8G2_ST7565_NHD_C12864_F_4W_SW_SPI u8g2(U8G2_R0,
 /* clock=*/LCD_CLOCK,
@@ -412,11 +426,11 @@ void setup() {
     rotationsPerFeeding.setOptimistic(true);
 
     // Setup Grams Per Feeding
-    gramsPerFeeding.setName("Grams Per Feeding");
+    gramsPerFeeding.setName("Grams Per Rotation");
     gramsPerFeeding.setIcon("mdi:weight-gram");
     gramsPerFeeding.setMode(HANumber::ModeBox);
     gramsPerFeeding.setMin(0.01f);
-    gramsPerFeeding.setMax(100.0f);
+    gramsPerFeeding.setMax(1000.0f);
     gramsPerFeeding.setStep(0.01f);
     gramsPerFeeding.onCommand(onGramsPerFeedingCommand);
     gramsPerFeeding.setOptimistic(true);
@@ -441,6 +455,16 @@ void setup() {
     gramsFedTodaySensor.setIcon("mdi:counter");
     gramsFedTodaySensor.setUnitOfMeasurement("g");
 
+    // CO Delta Sensor
+    COdelta.setName("CO Delta");
+    COdelta.setIcon("mdi:chart-line");
+    COdelta.setUnitOfMeasurement("°C");
+
+    // CWU Delta Sensor
+    CWUdelta.setName("CWU Delta");
+    CWUdelta.setIcon("mdi:chart-line");
+    CWUdelta.setUnitOfMeasurement("°C");
+
     mqtt.onMessage(onMqttMessage);
     mqtt.begin(config.mqtt_server, config.mqtt_user, config.mqtt_password);
     mqtt.loop();
@@ -459,7 +483,7 @@ void setup() {
     stepperSpeed.setState(static_cast<float>(config.StepperSpeed));
     stepperAccel.setState(static_cast<float>(config.StepperAccel));
     rotationsPerFeeding.setState(config.RotationsPerFeeding);
-    gramsPerFeeding.setState(config.GramsPerFeeding);
+    gramsPerFeeding.setState(config.GramsPerRotation);
     maxGramsPerDay.setState(config.MaxGramsPerDay);
 
     mqtt.loop();
@@ -666,8 +690,8 @@ void feedNow() {
     currentActivityState     = ACTIVITY_STEPPER;
 
     // Update grams feeded today
-    config.GramsFeededToday += static_cast<int>(config.GramsPerFeeding);
-    gramsFedTodaySensor.setValue(static_cast<float>(config.GramsFeededToday));
+    config.GramsFeededToday += config.GramsPerRotation * config.RotationsPerFeeding;
+    gramsFedTodaySensor.setValue(config.GramsFeededToday);
     config.saveToFS();
 }
 
@@ -731,7 +755,7 @@ void onRotationsPerFeedingCommand(HANumeric value, HANumber *sender) {
 }
 
 void onGramsPerFeedingCommand(HANumeric value, HANumber *sender) {
-    config.GramsPerFeeding = value.toFloat();
+    config.GramsPerRotation = value.toFloat();
     config.saveToFS();
     sender->setState(value);
 }
@@ -755,26 +779,56 @@ void onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length) {
     // Handle incoming MQTT messages if needed
     long currentTime = millis();
     if(strcmp(topic, DATA_PRIMARY_TOPIC) == 0) {
-        lastPrimaryData     = PrimaryData;
-        PrimaryData         = std::stof(std::string((const char *) payload, length));
+        PrimaryData                                     = std::stof(std::string((const char *) payload, length));
 
-        // Calculate delta
-        float timeDeltaSec  = (currentTime - lastPrimaryDataTime) / DELTA_TIME_DIVIDER;
-        PrimaryDelta        = (PrimaryData - lastPrimaryData) / timeDeltaSec;
+        // Store reading in ring buffer
+        primaryReadings[primaryReadingsIndex].value     = PrimaryData;
+        primaryReadings[primaryReadingsIndex].timestamp = currentTime;
+        primaryReadingsIndex                            = (primaryReadingsIndex + 1) % DELTA_READINGS_COUNT;
+        if(primaryReadingsCount < DELTA_READINGS_COUNT)
+            primaryReadingsCount++;
 
-        lastPrimaryDataTime = currentTime;
-        Serial.print("Primary Delta: ");
+        // Calculate delta based on oldest and newest readings in buffer
+        if(primaryReadingsCount >= 2) {
+            int   oldestIdx    = (primaryReadingsIndex - primaryReadingsCount + DELTA_READINGS_COUNT) % DELTA_READINGS_COUNT;
+            int   newestIdx    = (primaryReadingsIndex - 1 + DELTA_READINGS_COUNT) % DELTA_READINGS_COUNT;
+            float valueDiff    = primaryReadings[newestIdx].value - primaryReadings[oldestIdx].value;
+            float timeDeltaSec = (primaryReadings[newestIdx].timestamp - primaryReadings[oldestIdx].timestamp) / DELTA_TIME_DIVIDER;
+            if(timeDeltaSec > 0)
+                PrimaryDelta = valueDiff / timeDeltaSec;
+        }
+
+        COdelta.setValue(PrimaryDelta);
+
+        Serial.print("Primary Delta (based on ");
+        Serial.print(primaryReadingsCount);
+        Serial.print(" readings): ");
         Serial.println(PrimaryDelta);
     } else if(strcmp(topic, DATA_SECONDARY_TOPIC) == 0) {
-        lastSecondaryData     = SecondaryData;
-        SecondaryData         = std::stof(std::string((const char *) payload, length));
+        SecondaryData                                       = std::stof(std::string((const char *) payload, length));
 
-        // Calculate delta
-        float timeDeltaSec    = (currentTime - lastSecondaryDataTime) / DELTA_TIME_DIVIDER;
-        SecondaryDelta        = (SecondaryData - lastSecondaryData) / timeDeltaSec;
+        // Store reading in ring buffer
+        secondaryReadings[secondaryReadingsIndex].value     = SecondaryData;
+        secondaryReadings[secondaryReadingsIndex].timestamp = currentTime;
+        secondaryReadingsIndex                              = (secondaryReadingsIndex + 1) % DELTA_READINGS_COUNT;
+        if(secondaryReadingsCount < DELTA_READINGS_COUNT)
+            secondaryReadingsCount++;
 
-        lastSecondaryDataTime = currentTime;
-        Serial.print("Secondary Delta: ");
+        // Calculate delta based on oldest and newest readings in buffer
+        if(secondaryReadingsCount >= 2) {
+            int   oldestIdx    = (secondaryReadingsIndex - secondaryReadingsCount + DELTA_READINGS_COUNT) % DELTA_READINGS_COUNT;
+            int   newestIdx    = (secondaryReadingsIndex - 1 + DELTA_READINGS_COUNT) % DELTA_READINGS_COUNT;
+            float valueDiff    = secondaryReadings[newestIdx].value - secondaryReadings[oldestIdx].value;
+            float timeDeltaSec = (secondaryReadings[newestIdx].timestamp - secondaryReadings[oldestIdx].timestamp) / DELTA_TIME_DIVIDER;
+            if(timeDeltaSec > 0)
+                SecondaryDelta = valueDiff / timeDeltaSec;
+        }
+
+        CWUdelta.setValue(SecondaryDelta);
+
+        Serial.print("Secondary Delta (based on ");
+        Serial.print(secondaryReadingsCount);
+        Serial.print(" readings): ");
         Serial.println(SecondaryDelta);
     } else if(strcmp(topic, DATA3_TOPIC) == 0)
         Data3 = std::stof(std::string((const char *) payload, length));

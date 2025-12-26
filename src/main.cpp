@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <string>
 #include <AccelStepper.h>
+#include "HX711.h"
 
 #define LCD_CLOCK            1
 #define LCD_DATA             0
@@ -50,6 +51,10 @@
 #define STEPPER_MICROSTEPS   16
 #define STEPS_PER_REV        (200 * STEPPER_MICROSTEPS) // 200 full steps per revolution
 
+// scale
+#define DOUT_PIN             9
+#define SCK_PIN              8
+
 enum ActivityState {
     ACTIVITY_LOW,
     ACTIVITY_HIGH,
@@ -71,6 +76,8 @@ struct settings {
         float   RotationsPerFeeding = 1.0f;
         float   GramsPerRotation    = 1.0f;
         float   MaxGramsPerDay      = 100.0f;
+
+        long    calibrationFactor   = 1000; // HX711 calibration factor
 
         void    saveToFS() {
             File file = LittleFS.open("/settings.bin", "w");
@@ -115,6 +122,7 @@ WiFiClient             client;
 HADevice               device(DEVICE_NAME);
 HAMqtt                 mqtt(client, device);
 AccelStepper           stepper(AccelStepper::DRIVER, STEP_PIN, 8);
+HX711                  scale;
 
 hw_timer_t            *stepperTimer = NULL;
 portMUX_TYPE           stepperMux   = portMUX_INITIALIZER_UNLOCKED;
@@ -129,9 +137,12 @@ HANumber               rotationsPerFeeding("rotations_per_feeding", HABaseDevice
 HANumber               gramsPerFeeding("grams_per_feeding", HABaseDeviceType::PrecisionP2);
 HANumber               maxGramsPerDay("max_grams_per_day", HABaseDeviceType::PrecisionP2);
 
+HANumber               calibrationFactor("calibration_factor", HABaseDeviceType::PrecisionP0);
+
 HASensorNumber         gramsFedTodaySensor("grams_fed_today", HABaseDeviceType::PrecisionP1);
 HASensorNumber         COdelta("co_delta", HABaseDeviceType::PrecisionP2);
 HASensorNumber         CWUdelta("cwu_delta", HABaseDeviceType::PrecisionP2);
+HASensorNumber         ScaleSensor("scale_weight", HABaseDeviceType::PrecisionP1);
 
 HAButton               feedNowButton("feed_now");
 
@@ -205,6 +216,7 @@ void           onRotationsPerFeedingCommand(HANumeric value, HANumber *sender);
 void           onGramsPerFeedingCommand(HANumeric value, HANumber *sender);
 void           onMaxGramsPerDayCommand(HANumeric value, HANumber *sender);
 void           onFeedNowCommand(HAButton *sender);
+void           onCalibrationFactorCommand(HANumeric value, HANumber *sender);
 void           onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length);
 void           render();
 void           feedNow();
@@ -312,6 +324,13 @@ void setup() {
     digitalWrite(EN_PIN, HIGH); // Disable the stepper driver
     stepper.setMaxSpeed(config.StepperSpeed * STEPPER_MICROSTEPS);
     stepper.setAcceleration(config.StepperAccel * STEPPER_MICROSTEPS);
+
+    // Setup scale
+    Serial.println("Initializing scale...");
+    scale.begin(DOUT_PIN, SCK_PIN);
+    scale.set_scale(config.calibrationFactor); // Assuming default scale factor, adjust as needed
+    scale.tare();                              // Reset the scale to 0
+    Serial.println("Scale initialized.");
 
     // Initialize the display
     u8g2.begin();
@@ -465,6 +484,19 @@ void setup() {
     CWUdelta.setIcon("mdi:chart-line");
     CWUdelta.setUnitOfMeasurement("°C");
 
+    // Scale Sensor
+    ScaleSensor.setName("Scale Weight");
+    ScaleSensor.setIcon("mdi:weight-kilogram");
+    ScaleSensor.setUnitOfMeasurement("g");
+
+    // Calibration Factor
+    calibrationFactor.setName("Calibration Factor");
+    calibrationFactor.setIcon("mdi:tune");
+    calibrationFactor.setMode(HANumber::ModeBox);
+    calibrationFactor.setMin(100.0f);
+    calibrationFactor.setMax(10000.0f);
+    calibrationFactor.setStep(1.0f);
+
     mqtt.onMessage(onMqttMessage);
     mqtt.begin(config.mqtt_server, config.mqtt_user, config.mqtt_password);
     mqtt.loop();
@@ -512,6 +544,14 @@ void stepperLoop() {
         digitalWrite(EN_PIN, HIGH); // Disable the stepper driver
 }
 
+void scaleLoop() {
+    // Read weight from scale
+    if(scale.is_ready()) {
+        float weight = scale.get_units(10); // Average over 10 readings
+        ScaleSensor.setValue(weight);
+    }
+}
+
 void loop() {
     if(triggered1long) {
         trigger1long.trigger();
@@ -539,6 +579,7 @@ void loop() {
     serviceCheck();
     stepperLoop(); // Check if stepper finished
     checkNewDay(); // Check if a new day has started
+    scaleLoop();   // Read weight from scale
 
     long currentTime = millis();
 
@@ -768,6 +809,13 @@ void onMaxGramsPerDayCommand(HANumeric value, HANumber *sender) {
 
 void onFeedNowCommand(HAButton *sender) {
     feedNow();
+}
+
+void onCalibrationFactorCommand(HANumeric value, HANumber *sender) {
+    config.calibrationFactor = static_cast<long>(value.toFloat());
+    config.saveToFS();
+    scale.set_scale(config.calibrationFactor);
+    sender->setState(value);
 }
 
 void onMqttMessage(const char *topic, const uint8_t *payload, uint16_t length) {

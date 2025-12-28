@@ -52,8 +52,8 @@
 #define STEPS_PER_REV        (200 * STEPPER_MICROSTEPS) // 200 full steps per revolution
 
 // scale
-#define DOUT_PIN             9
-#define SCK_PIN              8
+#define DOUT_PIN             8
+#define SCK_PIN              9
 
 enum ActivityState {
     ACTIVITY_LOW,
@@ -325,12 +325,26 @@ void setup() {
     stepper.setMaxSpeed(config.StepperSpeed * STEPPER_MICROSTEPS);
     stepper.setAcceleration(config.StepperAccel * STEPPER_MICROSTEPS);
 
+    delay(2000);
     // Setup scale
     Serial.println("Initializing scale...");
     scale.begin(DOUT_PIN, SCK_PIN);
-    scale.set_scale(config.calibrationFactor); // Assuming default scale factor, adjust as needed
-    scale.tare();                              // Reset the scale to 0
-    Serial.println("Scale initialized.");
+
+    // Wait for HX711 to be ready with timeout
+    int scaleTimeout = 0;
+    while(!scale.is_ready() && scaleTimeout < 20) {
+        delay(100);
+        scaleTimeout++;
+        Serial.print(".");
+    }
+
+    if(scale.is_ready()) {
+        scale.set_scale(config.calibrationFactor);
+        scale.tare();
+        Serial.println("Scale initialized.");
+    } else {
+        Serial.println("Scale not found or not responding. Skipping initialization.");
+    }
 
     // Initialize the display
     u8g2.begin();
@@ -549,6 +563,9 @@ void scaleLoop() {
     if(scale.is_ready()) {
         float weight = scale.get_units(10); // Average over 10 readings
         ScaleSensor.setValue(weight);
+        Serial.print("Scale weight: ");
+        Serial.print(weight);
+        Serial.println(" g");
     }
 }
 
